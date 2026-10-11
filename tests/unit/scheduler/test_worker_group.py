@@ -427,8 +427,12 @@ class TestWorkerProcessGroup:
         group.messaging.receive_task = never
 
         try:
-            with patch(
-                "guidellm.scheduler.worker_group.settings.mp_poll_interval", 0.01
+            with (
+                patch(
+                    "guidellm.scheduler.worker_group.settings.mp_poll_interval",
+                    0.01,
+                ),
+                patch("guidellm.scheduler.worker_group.logger") as logger,
             ):
                 start = time.monotonic()
                 results = [update async for update in group.request_updates()]
@@ -437,7 +441,11 @@ class TestWorkerProcessGroup:
             never.cancel()
 
         assert results == []
-        assert elapsed < 5
+        # Deadline is 100 poll intervals (1 s here); it must be reached, not
+        # skipped, and must not be overshot by much.
+        assert 0.9 <= elapsed < 5
+        logger.warning.assert_called_once()
+        assert "deadline" in logger.warning.call_args.args[0]
 
     @pytest.mark.xfail(reason="old and broken", run=False)
     @pytest.mark.smoke

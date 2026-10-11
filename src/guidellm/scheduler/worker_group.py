@@ -425,12 +425,6 @@ class WorkerProcessGroup(Generic[RequestT, ResponseT]):
                 yield response, request, request_info, scheduler_state
             except asyncio.TimeoutError:
                 if self.shutdown_event.is_set():  # type: ignore[union-attr]
-                    # The receive thread sets shutdown_event from inside the
-                    # receive callback, before it buffers the update that
-                    # triggered it (the final request's completion). Drain until
-                    # the receive task has stopped so that update is not lost.
-                    async for update in self._drain_after_shutdown():
-                        yield update
                     break
                 # Time-based constraints (max_duration) must be evaluated even when
                 # workers are sleeping until a future target start, because no
@@ -444,6 +438,15 @@ class WorkerProcessGroup(Generic[RequestT, ResponseT]):
                         self.constraint_reached_event.set()
                     if state_update.stop_queueing:
                         self.state.stop_send_requests_event.set()
+
+        # The receive thread sets shutdown_event from inside the receive
+        # callback, before it buffers the update that triggered it (the final
+        # request's completion). Drain until the receive task has stopped so
+        # that update is not lost. Runs outside the except block so errors
+        # raised here are not chained to the poll's TimeoutError.
+        async with contextlib.aclosing(self._drain_after_shutdown()) as drain:
+            async for update in drain:
+                yield update
 
     async def _drain_after_shutdown(
         self,
@@ -459,19 +462,27 @@ class WorkerProcessGroup(Generic[RequestT, ResponseT]):
         Yield updates still buffered or in flight once shutdown_event is set.
 
         Polls the receive buffer until the messaging receive task has finished
-        and the buffer is empty, bounded by a deadline so a stuck receive task
-        cannot hang the caller.
+        and a poll after that finds the buffer empty. If no receive task is
+        running (None or not an asyncio.Task), stops at the first empty poll.
+        A receive task still running when a poll times out after the deadline
+        stops the drain, so a stuck receive task cannot hang the caller.
         """
         receive_task = getattr(self.messaging, "receive_task", None)
         deadline = time.monotonic() + settings.mp_poll_interval * 100
+        receive_stopped = False
         while True:
             try:
                 yield await self.messaging.get(  # type: ignore[union-attr]
                     timeout=settings.mp_poll_interval
                 )
             except asyncio.TimeoutError:
-                if not isinstance(receive_task, asyncio.Task) or receive_task.done():
+                if receive_stopped or not isinstance(receive_task, asyncio.Task):
                     return
+                if receive_task.done():
+                    # One more poll: anything the task buffered before it
+                    # stopped is still yielded, whatever its stop criteria.
+                    receive_stopped = True
+                    continue
                 if time.monotonic() >= deadline:
                     logger.warning(
                         "Receive task still running after shutdown drain deadline; "
