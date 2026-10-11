@@ -318,7 +318,9 @@ class TestWorkerProcessGroup:
         results = [update async for update in group.request_updates()]
 
         assert results == [payload]
-        assert get_calls == 3
+        # Third poll times out with shutdown set; the post-shutdown drain then
+        # polls once more and stops because the Mock has no receive task.
+        assert get_calls == 4
         group.state.update_state.assert_called()
 
     @pytest.mark.regression
@@ -351,6 +353,91 @@ class TestWorkerProcessGroup:
 
         assert results == []
         group.state.update_state.assert_not_called()
+
+    @staticmethod
+    def _shutdown_group() -> WorkerProcessGroup:
+        group = WorkerProcessGroup(
+            requests=["req"],
+            backend=MockBackend(),
+            strategy=SynchronousStrategy(),
+        )
+        error_event = Mock()
+        error_event.is_set.return_value = False
+        shutdown_event = Mock()
+        shutdown_event.is_set.return_value = True
+        group.error_event = error_event
+        group.shutdown_event = shutdown_event
+        group.state = Mock()
+        group.messaging = Mock()
+        return group
+
+    @pytest.mark.regression
+    @async_timeout(10)
+    @pytest.mark.asyncio
+    async def test_request_updates_yields_final_update_buffered_after_shutdown(self):
+        """The final update buffered after shutdown_event is set must be yielded.
+
+        The receive thread sets shutdown_event from inside the receive callback,
+        before it puts the triggering update (the last completion) in the buffer.
+        A poll that times out in that window must not end the iteration.
+        """
+        group = self._shutdown_group()
+        payload = (Mock(), "req", Mock(), Mock())
+        buffer: asyncio.Queue = asyncio.Queue()
+        polls_before_put = 0
+
+        async def receive_thread():
+            # Buffer the final update only after request_updates has already
+            # seen a poll time out with shutdown set.
+            while polls_before_put == 0:
+                await asyncio.sleep(0.01)
+            buffer.put_nowait(payload)
+
+        async def mock_get(*, timeout: float | None = None):
+            nonlocal polls_before_put
+            try:
+                return await asyncio.wait_for(buffer.get(), timeout=timeout)
+            except asyncio.TimeoutError:
+                polls_before_put += 1
+                raise
+
+        receive_task = asyncio.create_task(receive_thread())
+        group.messaging.get = mock_get
+        group.messaging.receive_task = receive_task
+
+        with patch("guidellm.scheduler.worker_group.settings.mp_poll_interval", 0.05):
+            results = [update async for update in group.request_updates()]
+
+        assert results == [payload]
+        assert receive_task.done()
+
+    @pytest.mark.regression
+    @async_timeout(10)
+    @pytest.mark.asyncio
+    async def test_request_updates_drain_stops_at_deadline(self):
+        """A receive task that never finishes must not hang request_updates."""
+        group = self._shutdown_group()
+
+        async def mock_get(*, timeout: float | None = None):
+            await asyncio.sleep(timeout or 0)
+            raise asyncio.TimeoutError
+
+        never = asyncio.create_task(asyncio.Event().wait())
+        group.messaging.get = mock_get
+        group.messaging.receive_task = never
+
+        try:
+            with patch(
+                "guidellm.scheduler.worker_group.settings.mp_poll_interval", 0.01
+            ):
+                start = time.monotonic()
+                results = [update async for update in group.request_updates()]
+                elapsed = time.monotonic() - start
+        finally:
+            never.cancel()
+
+        assert results == []
+        assert elapsed < 5
 
     @pytest.mark.xfail(reason="old and broken", run=False)
     @pytest.mark.smoke

@@ -425,7 +425,12 @@ class WorkerProcessGroup(Generic[RequestT, ResponseT]):
                 yield response, request, request_info, scheduler_state
             except asyncio.TimeoutError:
                 if self.shutdown_event.is_set():  # type: ignore[union-attr]
-                    # Everything yielded, exit
+                    # The receive thread sets shutdown_event from inside the
+                    # receive callback, before it buffers the update that
+                    # triggered it (the final request's completion). Drain until
+                    # the receive task has stopped so that update is not lost.
+                    async for update in self._drain_after_shutdown():
+                        yield update
                     break
                 # Time-based constraints (max_duration) must be evaluated even when
                 # workers are sleeping until a future target start, because no
@@ -439,6 +444,40 @@ class WorkerProcessGroup(Generic[RequestT, ResponseT]):
                         self.constraint_reached_event.set()
                     if state_update.stop_queueing:
                         self.state.stop_send_requests_event.set()
+
+    async def _drain_after_shutdown(
+        self,
+    ) -> AsyncIterator[
+        tuple[
+            ResponseT | None,
+            RequestT,
+            RequestInfo,
+            SchedulerState,
+        ]
+    ]:
+        """
+        Yield updates still buffered or in flight once shutdown_event is set.
+
+        Polls the receive buffer until the messaging receive task has finished
+        and the buffer is empty, bounded by a deadline so a stuck receive task
+        cannot hang the caller.
+        """
+        receive_task = getattr(self.messaging, "receive_task", None)
+        deadline = time.monotonic() + settings.mp_poll_interval * 100
+        while True:
+            try:
+                yield await self.messaging.get(  # type: ignore[union-attr]
+                    timeout=settings.mp_poll_interval
+                )
+            except asyncio.TimeoutError:
+                if not isinstance(receive_task, asyncio.Task) or receive_task.done():
+                    return
+                if time.monotonic() >= deadline:
+                    logger.warning(
+                        "Receive task still running after shutdown drain deadline; "
+                        "updates may be lost"
+                    )
+                    return
 
     async def shutdown(self) -> list[Exception]:
         """
